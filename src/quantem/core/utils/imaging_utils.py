@@ -373,6 +373,7 @@ def get_maxima_2D(
     img: torch.Tensor,
     min_spacing: float = 5,
     max_peaks: int = 64,
+    radial_weight: float = 0.01,
     subpixel_refine: bool = True,
 ):
 
@@ -387,11 +388,35 @@ def get_maxima_2D(
 
     intens = img[coords[:, 0], coords[:, 1]]
 
-    order = torch.argsort(intens, descending=True)
+    # radial weighting
+    cx, cy = coords[torch.argmax(intens)]
+    r = torch.sqrt((coords[:, 0] - cx) ** 2 + (coords[:, 1] - cy) ** 2)
+    score = intens * (1 + radial_weight * r)
+
+    order = torch.argsort(score, descending=True)
+
     coords = coords[order]
     intens = intens[order]
 
     peaks = torch.stack([coords[:, 0].float(), coords[:, 1].float(), intens], dim=1)
+
+    # enforce minimum spacing
+    if min_spacing > 0:
+        keep = torch.ones(len(peaks), dtype=torch.bool, device=device)
+
+        for i in range(len(peaks)):
+            if not keep[i]:
+                continue
+
+            dx = peaks[i, 0] - peaks[:, 0]
+            dy = peaks[i, 1] - peaks[:, 1]
+
+            close = (dx**2 + dy**2) < min_spacing**2
+            close[: i + 1] = False
+
+            keep[close] = False
+
+        peaks = peaks[keep]
 
     peaks = peaks[:max_peaks]
 
@@ -429,6 +454,7 @@ def detect_bragg_disks(
     probe,
     batch_size=256,
     min_distance=5,
+    radial_weight=0.01,
     max_peaks=64,
     subpixel_refine=True,
     device="cpu",
@@ -471,6 +497,7 @@ def detect_bragg_disks(
                 min_spacing=min_distance,
                 max_peaks=max_peaks,
                 subpixel_refine=subpixel_refine,
+                radial_weight=radial_weight,
             )
 
             idx = start + j
