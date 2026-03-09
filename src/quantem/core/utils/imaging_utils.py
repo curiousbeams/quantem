@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
 
@@ -245,8 +246,10 @@ def upsampled_correlation_torch(
 
     assert upsampleFactor > 2
 
-    xyShift = torch.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
-    globalShift = torch.floor(torch.ceil(torch.tensor(upsampleFactor * 1.5)) / 2.0)
+    device = imageCorr.device
+
+    xyShift = (torch.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)).to(device)
+    globalShift = torch.floor(torch.ceil(torch.tensor(upsampleFactor * 1.5)) / 2.0).to(device)
     upsampleCenter = globalShift - (upsampleFactor * xyShift)
 
     conj_input = imageCorr.conj()
@@ -286,7 +289,9 @@ def upsampled_correlation_torch(
     xySubShift = xySubShift.to(dtype=torch.get_default_dtype())
     xySubShift = xySubShift - globalShift.to(xySubShift.dtype)
 
-    xyShift = xyShift + (xySubShift + torch.tensor([dx, dy])) / float(upsampleFactor)
+    xyShift = xyShift + (xySubShift + torch.tensor([dx, dy], device=device)) / float(
+        upsampleFactor
+    )
 
     return xyShift
 
@@ -345,6 +350,135 @@ def dftUpsample_torch(
 
     # original code took xp.real(...) before returning
     return imageUpsample.real
+
+
+def _local_maxima_connected_8(img):
+
+    shifts = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+    maxima = torch.ones_like(img, dtype=torch.bool)
+
+    for dx, dy in shifts:
+        rolled = torch.roll(torch.roll(img, dx, 0), dy, 1)
+
+        if dx > 0 or dy > 0:
+            maxima &= img > rolled
+        else:
+            maxima &= img >= rolled
+
+    return maxima
+
+
+def get_maxima_2D(
+    img: torch.Tensor,
+    min_spacing: float = 5,
+    max_peaks: int = 64,
+    subpixel_refine: bool = True,
+):
+
+    H, W = img.shape
+    device = img.device
+
+    mask = _local_maxima_connected_8(img)
+    coords = torch.nonzero(mask)
+
+    if coords.numel() == 0:
+        return torch.zeros((0, 3), device=device)
+
+    intens = img[coords[:, 0], coords[:, 1]]
+
+    order = torch.argsort(intens, descending=True)
+    coords = coords[order]
+    intens = intens[order]
+
+    peaks = torch.stack([coords[:, 0].float(), coords[:, 1].float(), intens], dim=1)
+
+    peaks = peaks[:max_peaks]
+
+    if not subpixel_refine:
+        return peaks
+
+    # quadratic refinement
+    for i in range(len(peaks)):
+        x = int(peaks[i, 0])
+        y = int(peaks[i, 1])
+
+        if x < 1 or x >= H - 1 or y < 1 or y >= W - 1:
+            continue
+
+        Ix1 = img[x + 1, y]
+        Ix_1 = img[x - 1, y]
+        Iy1 = img[x, y + 1]
+        Iy_1 = img[x, y - 1]
+        I0 = img[x, y]
+
+        denom_x = 2 * (Ix1 + Ix_1 - 2 * I0)
+        denom_y = 2 * (Iy1 + Iy_1 - 2 * I0)
+
+        if denom_x != 0:
+            peaks[i, 0] += (Ix1 - Ix_1) / (2 * denom_x)
+
+        if denom_y != 0:
+            peaks[i, 1] += (Iy1 - Iy_1) / (2 * denom_y)
+
+    return peaks
+
+
+def detect_bragg_disks(
+    dataset,
+    probe,
+    batch_size=256,
+    min_distance=5,
+    max_peaks=64,
+    subpixel_refine=True,
+    device="cpu",
+):
+
+    dataset = torch.as_tensor(dataset, dtype=torch.float32, device=device)
+    probe = torch.as_tensor(probe, dtype=torch.float32, device=device)
+
+    probe = probe - probe.mean()
+    probe = probe / (probe.norm() + 1e-8)
+
+    Rx, Ry, Qx, Qy = dataset.shape
+    flat = dataset.view(-1, Qx, Qy)
+
+    # pad probe to detector
+    pad_x = (Qx - probe.shape[0]) // 2
+    pad_y = (Qy - probe.shape[1]) // 2
+
+    probe_padded = F.pad(
+        probe, (pad_y, Qy - probe.shape[1] - pad_y, pad_x, Qx - probe.shape[0] - pad_x)
+    )
+
+    F_probe = torch.fft.fft2(probe_padded)
+
+    results = []
+
+    N = flat.shape[0]
+
+    for start in range(0, N, batch_size):
+        batch = flat[start : start + batch_size]
+
+        F_batch = torch.fft.fft2(batch)
+
+        xcorr = torch.fft.ifft2(F_batch * F_probe.conj()).real
+        xcorr = torch.fft.fftshift(xcorr, dim=(-2, -1))
+
+        for j in range(xcorr.shape[0]):
+            peaks = get_maxima_2D(
+                xcorr[j],
+                min_spacing=min_distance,
+                max_peaks=max_peaks,
+                subpixel_refine=subpixel_refine,
+            )
+
+            idx = start + j
+            rx, ry = divmod(idx, Ry)
+
+            results.append((rx, ry, peaks))
+
+    return results
 
 
 def bilinear_kde(
@@ -841,7 +975,7 @@ def _build_edges(phi, reliability, mask=None, wrap_around=True):
         inc = _find_wrap(phi_f[i1], phi_f[i2])
         rel = rel_f[i1] + rel_f[i2]
 
-        edges.append(  # ty:ignore[possibly-missing-attribute]
+        edges.append(  # ty:ignore[unresolved-attribute]
             torch.stack([i1, i2, rel, inc], dim=1)
         )
 
