@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
 
+from quantem.core.datastructures.vector import Vector
 from quantem.core.utils.utils import generate_batches
 
 
@@ -469,6 +470,13 @@ def detect_bragg_disks(
     Rx, Ry, Qx, Qy = dataset.shape
     flat = dataset.view(-1, Qx, Qy)
 
+    # output vector container
+    vector = Vector.from_shape(
+        shape=(Rx, Ry),
+        fields=("kx", "ky", "intensity"),
+        units=("px", "px", "counts"),
+    )
+
     # pad probe to detector
     pad_x = (Qx - probe.shape[0]) // 2
     pad_y = (Qy - probe.shape[1]) // 2
@@ -478,8 +486,6 @@ def detect_bragg_disks(
     )
 
     F_probe = torch.fft.fft2(probe_padded)
-
-    results = []
 
     N = flat.shape[0]
 
@@ -502,10 +508,9 @@ def detect_bragg_disks(
 
             idx = start + j
             rx, ry = divmod(idx, Ry)
+            vector[rx, ry] = peaks.detach().cpu().numpy()
 
-            results.append((rx, ry, peaks))
-
-    return results
+    return vector
 
 
 def bilinear_kde(
